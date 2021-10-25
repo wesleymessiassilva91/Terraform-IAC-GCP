@@ -1,0 +1,67 @@
+podTemplate(
+    name: 'spring-boot-base',
+    label: 'spring-boot-base', 
+    namespace: 'devops',
+    containers: [
+        containerTemplate(name: 'docker-maven', image: 'docker-maven:3.8.1-jdk-11', command: 'sleep', args: '99d')
+    ],
+    volumes: [hostPathVolume(mountPath: '/var/run/docker.sock', hostPath: '/var/run/docker.sock')]
+) 
+{
+    node('spring-boot-base') {
+        def gitRepositoryUrl = ''
+
+        stage('Checkout') {
+            checkout([
+                $class: 'GitSCM', 
+                branches: [[name: '*/master']], 
+                extensions: [], 
+                userRemoteConfigs: [[credentialsId: 'github', url: gitRepositoryUrl]]
+            ])
+        }
+        stage('Build') {
+            container('docker-maven') { 
+                sh 'mvn clean package -DskipTests=true'
+            }
+        }
+        stage('SonarQube Analysis') {
+            withCredentials([string(credentialsId: 'sonar_token', variable: 'sonar_token')]) {  
+               def scannerHome = tool 'SONAR_SCANNER'
+
+                withSonarQubeEnv('SONAR_SERVER') {
+                    sh "${scannerHome}/bin/sonar-scanner -e -Dsonar.login=${sonar_token}"
+                }
+            }
+        }
+        stage('Quality Gate') {
+            sleep(5)
+            timeout(time: 2, unit: 'MINUTES') {
+                def qg = waitForQualityGate()
+                if (qg.status != 'OK') {
+                    error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+            }
+        }
+        stage('Package') {
+            container('docker-maven') { 
+                withCredentials([string(credentialsId: '', variable: '')]) {
+                    sh 'docker login -u _json_key -p "${gcp_secret}" https://gcr.io'
+                }
+                sh 'mvn clean install -Dregistry=gcr -DskipTests=true'
+            }
+        }
+        stage('Deploy to GKE') {
+            steps{
+                step([
+                    $class: 'KubernetesEngineBuilder',
+                    projectId: env.PROJECT_ID,
+                    clusterName: env.CLUSTER_NAME,
+                    location: env.LOCATION,
+                    manifestPattern: 'manifest.yaml',
+                    credentialsId: env.CREDENTIALS_ID,
+                    verifyDeployments: true
+                ])
+            }
+        }
+    }
+}
